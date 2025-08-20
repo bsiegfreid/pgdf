@@ -2,7 +2,21 @@ use chrono::NaiveDate;
 use polars::prelude::*;
 use tokio_postgres::{types::Type, Row};
 use std::error::Error as StdError;
+use uuid::{self, Uuid};
+use polars::error::PolarsError;
 
+/// Converts a vector of Postgres rows into a Polars DataFrame.
+/// # Arguments
+/// * `rows` - A slice of Postgres `Row` objects.
+/// # Returns
+/// * `Result<DataFrame, Box<dyn StdError>>` - A Polars DataFrame containing the data from the rows, or an error if conversion fails.
+/// # Errors
+/// Returns an error if the rows are empty or if any conversion fails.
+/// # Example
+/// ```
+/// let rows: Vec<Row> = ...; // Fetch rows from Postgres
+/// let df = postgres_to_polars(&rows).await?;
+/// ```
 pub async fn postgres_to_polars(rows: &[Row]) -> Result<DataFrame, Box<dyn StdError>> {
     if rows.is_empty() {
         return Err(Box::new(PolarsError::NoData("No data in rows".into())));
@@ -18,34 +32,13 @@ pub async fn postgres_to_polars(rows: &[Row]) -> Result<DataFrame, Box<dyn StdEr
 
         match *column_type {
 
-            Type::VARCHAR | Type::TEXT => {
-                let vals: Vec<Option<String>> = rows.iter()
-                    .map(|row| row.try_get::<_, &str>(col_index).ok().map(|v| v.to_string()))
-                    .collect();
-                df.with_column(Series::new(field_name.into(), vals))?;
-            }
-
-            Type::INT4 => {
-                let vals: Vec<Option<i32>> = rows.iter()
-                    .map(|row| row.try_get(col_index).ok())
-                    .collect();
-                df.with_column(Series::new(field_name.into(), vals))?;
-            }
-
-            Type::FLOAT8 => {
-                let vals: Vec<Option<f64>> = rows.iter()
-                    .map(|row| row.try_get(col_index).ok())
-                    .collect();
-                df.with_column(Series::new(field_name.into(), vals))?;
-            }
-
+            // Scalar types
             Type::BOOL => {
                 let vals: Vec<Option<bool>> = rows.iter()
                     .map(|row| row.try_get(col_index).ok())
                     .collect();
                 df.with_column(Series::new(field_name.into(), vals))?;
             }
-
             Type::DATE => {
                 let vals: Vec<Option<NaiveDate>> = rows.iter()
                     .map(|row| row.try_get::<_, NaiveDate>(col_index).ok())
@@ -56,18 +49,101 @@ pub async fn postgres_to_polars(rows: &[Row]) -> Result<DataFrame, Box<dyn StdEr
                     .collect();
                 df.with_column(Series::new(field_name.into(), vals))?;
             }
-
-            Type::VARCHAR_ARRAY | Type::TEXT_ARRAY => {
+            Type::FLOAT4 => {
+                let vals: Vec<Option<f32>> = rows.iter()
+                    .map(|row| row.try_get(col_index).ok())
+                    .collect();
+                df.with_column(Series::new(field_name.into(), vals))?;
+            }
+            Type::FLOAT8 => {
+                let vals: Vec<Option<f64>> = rows.iter()
+                    .map(|row| row.try_get(col_index).ok())
+                    .collect();
+                df.with_column(Series::new(field_name.into(), vals))?;
+            }
+            Type::INT4 => {
+                let vals: Vec<Option<i32>> = rows.iter()
+                    .map(|row| row.try_get(col_index).ok())
+                    .collect();
+                df.with_column(Series::new(field_name.into(), vals))?;
+            }
+            Type::INT8 => {
+                let vals: Vec<Option<i64>> = rows.iter()
+                    .map(|row| row.try_get(col_index).ok())
+                    .collect();
+                df.with_column(Series::new(field_name.into(), vals))?;
+            }
+            Type::NUMERIC => {
+                let vals: Vec<Option<tokio_postgres::types::Numeric>> = rows.iter()
+                    .map(|row| row.try_get(col_index).ok())
+                    .collect();
+                let vals: Vec<Option<f64>> = vals.into_iter()
+                    .map(|opt_num| opt_num.map(|num| num.to_f64().unwrap()))
+                    .collect();
+                df.with_column(Series::new(field_name.into(), vals))?;
+            }
+            Type::TIMESTAMP => {
+                let vals: Vec<Option<chrono::NaiveDateTime>> = rows.iter()
+                    .map(|row| row.try_get::<_, chrono::NaiveDateTime>(col_index).ok())
+                    .collect();
+                df.with_column(Series::new(field_name.into(), vals))?;
+            }
+            Type::TIMESTAMPTZ => {
+                let vals: Vec<Option<chrono::DateTime<chrono::Utc>>> = rows.iter()
+                    .map(|row| row.try_get::<_, chrono::DateTime<chrono::Utc>>(col_index).ok())
+                    .collect();
+                let vals: Vec<Option<chrono::NaiveDateTime>> = vals.into_iter()
+                    .map(|opt_dt| opt_dt.map(|dt| dt.naive_utc()))
+                    .collect();
+                df.with_column(Series::new(field_name.into(), vals))?;
+            }
+            Type::VARCHAR | Type::TEXT => {
                 let vals: Vec<Option<String>> = rows.iter()
-                    .map(|row| {
-                        row.try_get::<_, Vec<&str>>(col_index)
-                            .ok()
-                            .map(|v| serde_json::to_string(&v).unwrap())
-                    })
+                    .map(|row| row.try_get::<_, &str>(col_index).ok().map(|v| v.to_string()))
                     .collect();
                 df.with_column(Series::new(field_name.into(), vals))?;
             }
 
+            // Array types
+            Type::BOOL_ARRAY => {
+                let vals: Vec<Option<Vec<bool>>> = rows.iter()
+                    .map(|row| row.try_get(col_index).ok())
+                    .collect();
+                // Convert Vec<Option<Vec<bool>>> to ListChunked
+                let s = vals
+                    .into_iter()
+                    .map(|opt_vec| opt_vec.map(|v| Series::new("".into(), v)))
+                    .collect::<ListChunked>();
+                let mut s = s.into_series();
+                s.rename(field_name.into());
+                df.with_column(s)?;
+            }
+            Type::DATE_ARRAY => {
+                let vals: Vec<Option<Vec<NaiveDate>>> = rows.iter()
+                    .map(|row| row.try_get::<_, Vec<NaiveDate>>(col_index).ok())
+                    .collect();
+                // Convert Vec<Option<Vec<NaiveDate>>> to ListChunked
+                let s = vals
+                    .into_iter()
+                    .map(|opt_vec| opt_vec.map(|v| Series::new("".into(), v)))
+                    .collect::<ListChunked>();
+                let mut s = s.into_series();
+                s.rename(field_name.into());
+                df.with_column(s)?;
+            }
+            Type::FLOAT8_ARRAY => {
+                let vals: Vec<Option<Vec<f64>>> = rows.iter()
+                    .map(|row| row.try_get(col_index).ok())
+                    .collect();
+                // Convert Vec<Option<Vec<f64>>> to ListChunked
+                let s = vals
+                    .into_iter()
+                    .map(|opt_vec| opt_vec.map(|v| Series::new("".into(), v)))
+                    .collect::<ListChunked>();
+                let mut s = s.into_series();
+                s.rename(field_name.into());
+                df.with_column(s)?;
+            }
             Type::INT4_ARRAY => {
                 let vals: Vec<Option<Vec<i32>>> = rows.iter()
                     .map(|row| row.try_get(col_index).ok())
@@ -81,10 +157,13 @@ pub async fn postgres_to_polars(rows: &[Row]) -> Result<DataFrame, Box<dyn StdEr
                 s.rename(field_name.into());
                 df.with_column(s)?;
             }
-
-            Type::FLOAT8_ARRAY => {
+            Type::NUMERIC_ARRAY => {
                 let vals: Vec<Option<Vec<f64>>> = rows.iter()
-                    .map(|row| row.try_get(col_index).ok())
+                    .map(|row| {
+                        row.try_get::<_, Vec<tokio_postgres::types::Numeric>>(col_index)
+                            .ok()
+                            .map(|v| v.into_iter().map(|n| n.to_f64().unwrap()).collect())
+                    })
                     .collect();
                 // Convert Vec<Option<Vec<f64>>> to ListChunked
                 let s = vals
@@ -94,6 +173,70 @@ pub async fn postgres_to_polars(rows: &[Row]) -> Result<DataFrame, Box<dyn StdEr
                 let mut s = s.into_series();
                 s.rename(field_name.into());
                 df.with_column(s)?;
+            }
+            Type::TIMESTAMP_ARRAY => {
+                let vals: Vec<Option<Vec<chrono::NaiveDateTime>>> = rows.iter()
+                    .map(|row| row.try_get::<_, Vec<chrono::NaiveDateTime>>(col_index).ok())
+                    .collect();
+                // Convert Vec<Option<Vec<chrono::NaiveDateTime>>> to ListChunked
+                let s = vals
+                    .into_iter()
+                    .map(|opt_vec| opt_vec.map(|v| Series::new("".into(), v)))
+                    .collect::<ListChunked>();
+                let mut s = s.into_series();
+                s.rename(field_name.into());
+                df.with_column(s)?;
+            }
+            Type::TIMESTAMPTZ_ARRAY => {
+                let vals: Vec<Option<Vec<chrono::DateTime<chrono::Utc>>>> = rows.iter()
+                    .map(|row| row.try_get::<_, Vec<chrono::DateTime<chrono::Utc>>>(col_index).ok())
+                    .collect();
+                // Convert Vec<Option<Vec<chrono::DateTime<chrono::Utc>>>> to ListChunked
+                let s = vals
+                    .into_iter()
+                    .map(|opt_vec| opt_vec.map(|v| Series::new("".into(), v)))
+                    .collect::<ListChunked>();
+                let mut s = s.into_series();
+                s.rename(field_name.into());
+                df.with_column(s)?;
+            }
+            Type::VARCHAR_ARRAY | Type::TEXT_ARRAY => {
+                let vals: Vec<Option<String>> = rows.iter()
+                    .map(|row| {
+                        row.try_get::<_, Vec<&str>>(col_index)
+                            .ok()
+                            .map(|v| serde_json::to_string(&v).unwrap())
+                    })
+                    .collect();
+                df.with_column(Series::new(field_name.into(), vals))?;
+            }
+
+            // JSON and UUID types
+            Type::JSON | Type::JSONB => {
+                let vals: Vec<Option<String>> = rows.iter()
+                    .map(|row| row.try_get::<_, serde_json::Value>(col_index).ok().map(|v| v.to_string()))
+                    .collect();
+                df.with_column(Series::new(field_name.into(), vals))?;
+            }
+            Type::JSON_ARRAY | Type::JSONB_ARRAY => {
+                let vals: Vec<Option<String>> = rows.iter()
+                    .map(|row| {
+                        row.try_get::<_, Vec<serde_json::Value>>(col_index)
+                            .ok()
+                            .map(|v| serde_json::to_string(&v).unwrap())
+                    })
+                    .collect();
+                df.with_column(Series::new(field_name.into(), vals))?;
+            }
+            Type::UUID_ARRAY | Type::UUID => {
+                let vals: Vec<Option<String>> = rows.iter()
+                    .map(|row| {
+                        row.try_get::<_, Uuid>(col_index)
+                            .ok()
+                            .map(|v| v.to_string())
+                    })
+                    .collect();
+                df.with_column(Series::new(field_name.into(), vals))?;
             }
 
             _ => {
